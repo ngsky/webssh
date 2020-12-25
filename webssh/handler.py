@@ -1,3 +1,4 @@
+# coding=utf-8
 import io
 import json
 import logging
@@ -40,6 +41,7 @@ class InvalidValueError(Exception):
     pass
 
 
+""" 通过 继承 paramiko.SSHClient 实现自己SSHClient  """
 class SSHClient(paramiko.SSHClient):
 
     def handler(self, title, instructions, prompt_list):
@@ -66,6 +68,7 @@ class SSHClient(paramiko.SSHClient):
         allowed_types = set()
         two_factor_types = {'keyboard-interactive', 'password'}
 
+        """ 优先通过公私钥方式建立连接 """
         if pkey is not None:
             logging.info('Trying publickey authentication')
             try:
@@ -82,6 +85,7 @@ class SSHClient(paramiko.SSHClient):
             logging.info('Trying publickey 2fa')
             return self.auth_interactive(username, self.handler)
 
+        """ 采用密码方式建立ssh连接"""
         if password is not None:
             logging.info('Trying password authentication')
             try:
@@ -183,6 +187,7 @@ class PrivateKey(object):
         raise InvalidValueError(msg)
 
 
+""" 处理器基类，有点类似拦截器的作用 """
 class MixinHandler(object):
 
     custom_headers = {
@@ -197,6 +202,7 @@ class MixinHandler(object):
         self.loop = loop
         self.origin_policy = self.settings.get('origin_policy')
 
+    """ 检查请求"""
     def check_request(self):
         context = self.request.connection.context
         result = self.is_forbidden(context, self.request.host_name)
@@ -214,6 +220,7 @@ class MixinHandler(object):
         else:
             self.context = context
 
+    """ 检查请求源,跨域 """
     def check_origin(self, origin):
         if self.origin_policy == '*':
             return True
@@ -303,6 +310,7 @@ class MixinHandler(object):
         return (ip, port)
 
 
+""" 404 错误处理器 """
 class NotFoundHandler(MixinHandler, tornado.web.ErrorHandler):
 
     def initialize(self):
@@ -312,10 +320,13 @@ class NotFoundHandler(MixinHandler, tornado.web.ErrorHandler):
         raise tornado.web.HTTPError(404)
 
 
+""" Web 服务处理器 """
 class IndexHandler(MixinHandler, tornado.web.RequestHandler):
 
+    """ 设置最大线程数量为 cpu 数量的5倍 """
     executor = ThreadPoolExecutor(max_workers=cpu_count()*5)
 
+    """ 请求达到时首先会执行该函数  """
     def initialize(self, loop, policy, host_keys_settings):
         super(IndexHandler, self).initialize(loop)
         self.policy = policy
@@ -338,6 +349,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         else:
             super(IndexHandler, self).write_error(status_code, **kwargs)
 
+    """ 获取ssh client 对象"""
     def get_ssh_client(self):
         ssh = SSHClient()
         ssh._system_host_keys = self.host_keys_settings['system_host_keys']
@@ -346,6 +358,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         ssh.set_missing_host_key_policy(self.policy)
         return ssh
 
+    """ 获取ssh 私钥"""
     def get_privatekey(self):
         name = 'privatekey'
         lst = self.request.files.get(name)
@@ -361,12 +374,14 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
 
         return value, filename
 
+    """ 获取主机名称 """
     def get_hostname(self):
         value = self.get_value('hostname')
         if not (is_valid_hostname(value) or is_valid_ip_address(value)):
             raise InvalidValueError('Invalid hostname: {}'.format(value))
         return value
 
+    """ 获取端口"""
     def get_port(self):
         value = self.get_argument('port', u'')
         if not value:
@@ -440,6 +455,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         logging.warning('Could not detect the default encoding.')
         return 'utf-8'
 
+    """ 建立ssh连接 """
     def ssh_connect(self, args):
         ssh = self.ssh_client
         dst_addr = args[:2]
@@ -481,9 +497,11 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
     def head(self):
         pass
 
+    """ 初始化表单页面 """
     def get(self):
         self.render('index.html', debug=self.debug, font=self.font)
 
+    """ 前端提交ssh登录信息API """
     @tornado.gen.coroutine
     def post(self):
         if self.debug and self.get_argument('error', u''):
@@ -498,10 +516,12 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         self.check_origin()
 
         try:
+            """ 获取到前端传入的待连接服务器配置信息：host,port,username,password """
             args = self.get_args()
         except InvalidValueError as exc:
             raise tornado.web.HTTPError(400, str(exc))
 
+        """ 提交ssh连接任务 """
         future = self.executor.submit(self.ssh_connect, args)
 
         try:
@@ -512,6 +532,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         else:
             if not workers:
                 clients[ip] = workers
+            """ 为当前连接建立工作线程 worker """
             worker.src_addr = (ip, port)
             workers[worker.id] = worker
             self.loop.call_later(options.delay, recycle_worker, worker)
@@ -520,12 +541,14 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         self.write(self.result)
 
 
+""" WebSocket 处理器,命令行数据实时交互 """
 class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
 
     def initialize(self, loop):
         super(WsockHandler, self).initialize(loop)
         self.worker_ref = None
 
+    """ 登录验证成功后，进入命令行界面入口"""
     def open(self):
         self.src_addr = self.get_client_addr()
         logging.info('Connected from {}:{}'.format(*self.src_addr))
@@ -536,10 +559,12 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
             return
 
         try:
+            """ id为当前工作线程唯一标识 """
             worker_id = self.get_value('id')
         except (tornado.web.MissingArgumentError, InvalidValueError) as exc:
             self.close(reason=str(exc))
         else:
+            """ 根据 work_id 拿到建立连接时的worker """
             worker = workers.get(worker_id)
             if worker:
                 workers[worker_id] = None
@@ -550,6 +575,7 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
             else:
                 self.close(reason='Websocket authentication failed.')
 
+    """ 命令行实时交互:每次键入都会执行 """
     def on_message(self, message):
         logging.debug('{!r} from {}:{}'.format(message, *self.src_addr))
         worker = self.worker_ref()
@@ -570,9 +596,12 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
 
         data = msg.get('data')
         if data and isinstance(data, UnicodeType):
+            """ 将前端命令行数据转入 worker 进行处理(发送到真实连接的服务器上) """
             worker.data_to_dst.append(data)
+            """ 阻塞：获取到响应结果并写回websocket通道 """
             worker.on_write()
 
+    """ 关闭连接 """
     def on_close(self):
         logging.info('Disconnected from {}:{}'.format(*self.src_addr))
         if not self.close_reason:
